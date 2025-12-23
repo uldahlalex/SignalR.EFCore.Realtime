@@ -1,5 +1,3 @@
-using Tapper;
-
 namespace SignalR.EFCore.Realtime;
 
 /// <summary>
@@ -17,7 +15,6 @@ public class RealtimeQueryAttribute<TEntity> : Attribute
 /// Request wrapper that indicates whether realtime mode should be enabled.
 /// Add this as the last parameter to any hub method to support reactive queries.
 /// </summary>
-[TranspilationSource]
 public class RealtimeOptions
 {
     /// <summary>
@@ -29,7 +26,6 @@ public class RealtimeOptions
 /// <summary>
 /// Response wrapper for reactive queries.
 /// </summary>
-[TranspilationSource]
 public class RealtimeResponse<T>
 {
     /// <summary>
