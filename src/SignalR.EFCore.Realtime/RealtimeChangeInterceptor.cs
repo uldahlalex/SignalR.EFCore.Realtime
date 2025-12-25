@@ -185,8 +185,14 @@ public class RealtimeChangeInterceptor(
                     _ => EntityChangeType.Modified
                 };
 
-                // Serialize entity for transmission (just ID and type info)
-                var entityData = JsonSerializer.Serialize(entity);
+                // Serialize entity for transmission
+                // Use IgnoreCycles to handle navigation properties (e.g., Game.Gamerounds)
+                var serializerOptions = new JsonSerializerOptions
+                {
+                    ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles,
+                    WriteIndented = false
+                };
+                var entityData = JsonSerializer.Serialize(entity, serializerOptions);
 
                 var notification = new EntityChangeNotification
                 {

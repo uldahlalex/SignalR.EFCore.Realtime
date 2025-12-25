@@ -10,26 +10,3 @@ public class RealtimeQueryAttribute<TEntity> : Attribute
     where TEntity : class
 {
 }
-
-/// <summary>
-/// Request wrapper that indicates whether realtime mode should be enabled.
-/// Add this as the last parameter to any hub method to support reactive queries.
-/// </summary>
-public class RealtimeOptions
-{
-    /// <summary>
-    /// When true, the server will automatically push updates when relevant data changes.
-    /// </summary>
-    public bool Enabled { get; init; }
-}
-
-/// <summary>
-/// Response wrapper for reactive queries.
-/// </summary>
-public class RealtimeResponse<T>
-{
-    /// <summary>
-    /// The query result data.
-    /// </summary>
-    public required T Data { get; init; }
-}

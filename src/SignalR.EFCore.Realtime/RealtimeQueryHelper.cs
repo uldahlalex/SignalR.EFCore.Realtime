@@ -6,41 +6,70 @@ using Microsoft.Extensions.Logging;
 namespace SignalR.EFCore.Realtime;
 
 /// <summary>
+/// Delegate for executing a query that will be re-run when entity changes are detected.
+/// </summary>
+/// <typeparam name="TResult">The type of data returned by the query</typeparam>
+/// <param name="services">The service provider for resolving dependencies</param>
+/// <param name="authenticatedUserId">The ID of the authenticated user making the request</param>
+/// <returns>The query result that will be broadcast to the client</returns>
+public delegate Task<TResult> RealtimeQueryDelegate<TResult>(IServiceProvider services, string authenticatedUserId);
+
+/// <summary>
+/// Delegate for filtering which entity changes should trigger a query re-execution.
+/// </summary>
+/// <param name="changedEntity">The entity that was added, updated, or deleted</param>
+/// <returns>True if this change should trigger the query to re-run and broadcast</returns>
+public delegate bool EntityChangeFilter(object changedEntity);
+
+/// <summary>
 /// Helper methods for implementing realtime server-push pattern in SignalR hubs.
 /// </summary>
 public static class RealtimeQueryHelper
 {
     /// <summary>
-    /// Wraps a query result and registers a reactive query subscription.
+    /// Registers a reactive query subscription for a hub method.
     /// The server will automatically re-execute the query and push results when relevant data changes.
-    ///
-    /// Usage in hub methods:
+    /// </summary>
+    /// <typeparam name="TResult">The type of data returned by the query</typeparam>
+    /// <param name="hub">The SignalR hub instance</param>
+    /// <param name="executeQuery">
+    /// Function that executes the query. It will be called:
+    /// <list type="bullet">
+    /// <item>Initially when the hub method is invoked</item>
+    /// <item>Each time a relevant entity change is detected</item>
+    /// </list>
+    /// Parameters: (services, authenticatedUserId) => Task&lt;TResult&gt;
+    /// </param>
+    /// <param name="shouldReactToChange">
+    /// Optional filter to determine which entity changes should trigger re-execution.
+    /// If null, any change to entities specified in [RealtimeQuery&lt;T&gt;] will trigger.
+    /// Example: entity => entity is Game g && g.Id == gameId
+    /// </param>
+    /// <example>
     /// <code>
     /// [RealtimeQuery&lt;Game&gt;]
-    /// public async Task&lt;RealtimeResponse&lt;GameReturnDto&gt;&gt; GetGameRealtime(GetGameRequestDto dto, RealtimeOptions? options = null)
+    /// public async Task&lt;GameReturnDto&gt; GetGameRealtime(GetGameRequestDto dto)
     /// {
     ///     var data = await quizService.GetGame(dto);
-    ///     return await this.WrapRealtime(
-    ///         data,
-    ///         options,
-    ///         queryExecutor: async (sp, uid) => await quizService.GetGame(dto),
-    ///         changeFilter: entity => entity is Game g && g.Id == dto.GameId
+    ///
+    ///     await this.EnableRealtime(
+    ///         executeQuery: async (services, userId) => {
+    ///             var service = services.GetRequiredService&lt;IQuizService&gt;();
+    ///             return await service.GetGame(dto);
+    ///         },
+    ///         shouldReactToChange: entity => entity is Game g && g.Id == dto.GameId
     ///     );
+    ///
+    ///     return data;
     /// }
     /// </code>
-    /// </summary>
-    public static async Task<RealtimeResponse<T>> WrapRealtime<T>(
+    /// </example>
+    public static async Task EnableRealtime<TResult>(
         this Hub hub,
-        T data,
-        RealtimeOptions? options = null,
-        Func<IServiceProvider, string, Task<T>>? queryExecutor = null,
-        Func<object, bool>? changeFilter = null,
+        RealtimeQueryDelegate<TResult>? executeQuery = null,
+        EntityChangeFilter? shouldReactToChange = null,
         [System.Runtime.CompilerServices.CallerMemberName] string callerName = "")
     {
-        if (options?.Enabled != true)
-        {
-            return new RealtimeResponse<T> { Data = data };
-        }
 
         var logger = hub.Context.GetHttpContext()?.RequestServices
             .GetService<ILogger<RealtimeChangeInterceptor>>();
@@ -79,27 +108,31 @@ public static class RealtimeQueryHelper
         }
 
         // Server-push mode: Register reactive query subscription (server re-executes query on changes)
-        if (queryExecutor == null)
+        if (executeQuery == null)
         {
-            throw new InvalidOperationException("queryExecutor is required for reactive queries");
+            throw new InvalidOperationException("executeQuery is required for reactive queries");
         }
 
-        var interceptor = hub.Context.GetHttpContext()?.RequestServices
-            .GetRequiredService<RealtimeChangeInterceptor>();
+        var serviceProvider = hub.Context.GetHttpContext()?.RequestServices
+            ?? throw new InvalidOperationException("ServiceProvider not available");
 
-        if (interceptor == null)
-        {
-            throw new InvalidOperationException("RealtimeChangeInterceptor not available in DI");
-        }
+        var interceptor = serviceProvider.GetRequiredService<RealtimeChangeInterceptor>();
 
         var userId = hub.Context.UserIdentifier
             ?? throw new InvalidOperationException("User must be authenticated for reactive queries");
 
-        // Create broadcast callback that sends data to the specific client
         var connectionId = hub.Context.ConnectionId;
+
+        // Get IHubContext once and capture it (it's a singleton, won't be disposed)
+        var hubContextType = typeof(IHubContext<>).MakeGenericType(hubType);
+        var hubContext = serviceProvider.GetRequiredService(hubContextType) as IHubContext
+            ?? throw new InvalidOperationException($"Could not resolve IHubContext for {hubType.Name}");
+
+        // Create broadcast callback that sends data to the specific client
+        // We capture IHubContext (singleton) instead of Hub instance (scoped/disposed)
         Func<object, Task> broadcastCallback = async (data) =>
         {
-            var clientsProxy = hub.Clients.Client(connectionId);
+            var clientsProxy = hubContext.Clients.Client(connectionId);
             await clientsProxy.SendCoreAsync("OnBroadcast", new[] { data });
         };
 
@@ -111,9 +144,9 @@ public static class RealtimeQueryHelper
                 ConnectionId = connectionId,
                 UserId = userId,
                 EntityType = entityType,
-                QueryExecutor = async (serviceProvider, uid) => await queryExecutor(serviceProvider, uid),
+                QueryExecutor = async (serviceProvider, uid) => await executeQuery(serviceProvider, uid),
                 BroadcastCallback = broadcastCallback,
-                ChangeFilter = changeFilter
+                ChangeFilter = shouldReactToChange
             };
 
             interceptor.Subscribe(subscription);
@@ -122,10 +155,5 @@ public static class RealtimeQueryHelper
                 "✅ Registered reactive query: Method={Method}, ConnectionId={ConnectionId}, User={UserId}, EntityType={EntityType}",
                 callingMethod.Name, connectionId, userId, entityType.Name);
         }
-
-        return new RealtimeResponse<T>
-        {
-            Data = data
-        };
     }
 }

@@ -39,7 +39,7 @@ public class ReactiveQuerySubscription
     /// For example, for game queries, only re-execute if the changed entity is the specific game we're watching.
     /// Returns true if subscription should be notified.
     /// </summary>
-    public Func<object, bool>? ChangeFilter { get; init; }
+    public EntityChangeFilter? ChangeFilter { get; init; }
 
     /// <summary>
     /// Timestamp when this subscription was created.
