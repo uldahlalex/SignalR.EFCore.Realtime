@@ -168,6 +168,109 @@ public class RealtimeChangeInterceptor(
     }
 
     /// <summary>
+    /// Extracts simple key properties from an entity for backplane transmission.
+    /// Only includes primitive types, strings, GUIDs, and DateTimes - skips navigation properties.
+    /// </summary>
+    private static Dictionary<string, object?> ExtractKeyProperties(object entity)
+    {
+        var properties = new Dictionary<string, object?>();
+        var entityType = entity.GetType();
+
+        foreach (var prop in entityType.GetProperties())
+        {
+            // Skip navigation properties (complex types)
+            if (!IsSimpleType(prop.PropertyType))
+                continue;
+
+            try
+            {
+                var value = prop.GetValue(entity);
+                properties[prop.Name] = value;
+            }
+            catch
+            {
+                // Skip properties that can't be read
+            }
+        }
+
+        return properties;
+    }
+
+    /// <summary>
+    /// Creates a lightweight entity proxy with only key properties populated.
+    /// Used for changeFilter checks - navigation properties remain null.
+    /// </summary>
+    private static object CreateEntityProxy(Type entityType, Dictionary<string, object?> keyProperties)
+    {
+        // Create instance (works for types with parameterless constructor)
+        var entity = Activator.CreateInstance(entityType)
+            ?? throw new InvalidOperationException($"Could not create instance of {entityType.Name}");
+
+        // Populate key properties via reflection
+        foreach (var (propName, value) in keyProperties)
+        {
+            var prop = entityType.GetProperty(propName);
+            if (prop != null && prop.CanWrite)
+            {
+                try
+                {
+                    // Handle JSON deserialization type conversion
+                    object? convertedValue = value;
+                    if (value != null && value is JsonElement jsonElement)
+                    {
+                        convertedValue = JsonElementToValue(jsonElement, prop.PropertyType);
+                    }
+
+                    prop.SetValue(entity, convertedValue);
+                }
+                catch
+                {
+                    // Skip properties that can't be set
+                }
+            }
+        }
+
+        return entity;
+    }
+
+    /// <summary>
+    /// Converts JsonElement to the target property type
+    /// </summary>
+    private static object? JsonElementToValue(JsonElement element, Type targetType)
+    {
+        var underlyingType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+        return underlyingType switch
+        {
+            Type t when t == typeof(string) => element.GetString(),
+            Type t when t == typeof(int) => element.GetInt32(),
+            Type t when t == typeof(long) => element.GetInt64(),
+            Type t when t == typeof(bool) => element.GetBoolean(),
+            Type t when t == typeof(DateTime) => element.GetDateTime(),
+            Type t when t == typeof(Guid) => element.GetGuid(),
+            Type t when t == typeof(decimal) => element.GetDecimal(),
+            Type t when t == typeof(double) => element.GetDouble(),
+            _ => element.Deserialize(targetType)
+        };
+    }
+
+    /// <summary>
+    /// Determines if a type is simple (can be serialized without issues)
+    /// </summary>
+    private static bool IsSimpleType(Type type)
+    {
+        return type.IsPrimitive
+               || type.IsEnum
+               || type == typeof(string)
+               || type == typeof(decimal)
+               || type == typeof(DateTime)
+               || type == typeof(DateTimeOffset)
+               || type == typeof(TimeSpan)
+               || type == typeof(Guid)
+               || (Nullable.GetUnderlyingType(type) != null && IsSimpleType(Nullable.GetUnderlyingType(type)!));
+    }
+
+    /// <summary>
     /// Publishes entity changes to the backplane for distribution to other server instances.
     /// </summary>
     private async Task PublishToBackplane(List<(object Entity, EntityState State)> entries)
@@ -185,14 +288,10 @@ public class RealtimeChangeInterceptor(
                     _ => EntityChangeType.Modified
                 };
 
-                // Serialize entity for transmission
-                // Use IgnoreCycles to handle navigation properties (e.g., Game.Gamerounds)
-                var serializerOptions = new JsonSerializerOptions
-                {
-                    ReferenceHandler = System.Text.Json.Serialization.ReferenceHandler.IgnoreCycles,
-                    WriteIndented = false
-                };
-                var entityData = JsonSerializer.Serialize(entity, serializerOptions);
+                // Extract only key properties for serialization (not the entire entity graph)
+                // This avoids cycles and reduces Redis payload size
+                var keyProperties = ExtractKeyProperties(entity);
+                var entityData = JsonSerializer.Serialize(keyProperties);
 
                 var notification = new EntityChangeNotification
                 {
@@ -319,7 +418,17 @@ public class RealtimeChangeInterceptor(
                     notification.ChangeType,
                     notification.ServerId ?? "unknown");
 
-                // Deserialize the entity
+                // Deserialize key properties (not the full entity - we'll re-query the database)
+                var keyProperties = JsonSerializer.Deserialize<Dictionary<string, object?>>(notification.EntityData);
+                if (keyProperties == null)
+                {
+                    logger.LogWarning(
+                        "Failed to deserialize entity key properties for {EntityTypeName}",
+                        notification.EntityTypeName);
+                    return;
+                }
+
+                // Resolve entity type for subscription lookup
                 var entityType = Type.GetType(notification.EntityTypeName);
                 if (entityType == null)
                 {
@@ -329,14 +438,8 @@ public class RealtimeChangeInterceptor(
                     return;
                 }
 
-                var entity = JsonSerializer.Deserialize(notification.EntityData, entityType);
-                if (entity == null)
-                {
-                    logger.LogWarning(
-                        "Failed to deserialize entity data for {EntityTypeName}",
-                        notification.EntityTypeName);
-                    return;
-                }
+                // Create a lightweight proxy for changeFilter checks
+                var entity = CreateEntityProxy(entityType, keyProperties);
 
                 // Process remote change as if it was local
                 var state = notification.ChangeType switch
